@@ -1,0 +1,106 @@
+#!/bin/sh
+# MultiOS Installer
+
+echo "Welcome to the MultiOS Installer!"
+echo
+
+fdev= # 要制作的安装U盘的设备名
+isobytes= # ISO文件的大小（以字节为单位，创建分区时以扇区为单位）
+arch=x86_64 # 要安装的系统架构
+# 选择U盘设备
+choose_dev() {
+lsblk | sed -n '2,$p' | grep "^[a-z]" | awk '{print NR" /dev/"$0}'
+read -p "Please choose the device you need to boot multiple OS: " dev
+read -p "Your choice is $dev(yes or no): " confirm
+
+if [ -b "$dev" ] && [ "$confirm" = yes  ]
+then
+	fdev=$dev
+fi
+}
+
+# 显示磁盘分区信息以及U盘剩余空间
+print_dev_info() {
+fdisk -l $fdev 2>/dev/null | grep $fdev | awk '{print "设备总容量："$3"GB"}'
+fdisk -l $fdev 2>/dev/null | grep "^ " | awk '{print "/dev/sdb"$1" "$4}'
+# todo：计算磁盘剩余空间
+echo --------------------------------------------
+}
+
+# 创建boot分区
+create_boot_partition() {
+parted -s $fdev mklabel gpt
+parted -s $fdev mkpart "EFI" 2048B 411647B 
+parted -s $fdev set 1 boot
+mkfs.vfat ${fdev}1
+mkdir /mnt/efi
+mount ${fdev}1 /mnt/efi/
+mkdir /mnt/efi/grub2
+grub2-install --efi-directory=/mnt/efi/ --boot-directory=/mnt/efi/ --directory=./${arch}-efi --removable
+}
+
+# 删除所有U盘分区
+delete_all_partition() {
+# 获取分区数量
+pnum=$(fdisk -l /dev/sdb 2>/dev/null| grep "^ " | sed -n '$'p | awk '{print $1}')
+while [ $pnum -gt 0 ]
+do
+	parted -s $fdev rm $pnum
+	pnum=$(expr $pnum - 1)
+done
+}
+
+# 创建新系统分区
+create_sys_partition() {
+bytes=$1
+# 获取U盘新的分区的开始字节数
+nextbyte=$(expr $(parted -s $fdev u B print | grep "^ " | sed -n "$"p | awk '{print $3}' | sed 's/B//') + 1)
+echo "Start byte: "$nextbyte
+echo "bytes: "$bytes
+endbyte=$(expr $nextbyte + $bytes + 1)
+echo "End byte: "$endbyte
+parted -s $fdev mkpart primary ${nextbyte}B ${endbyte}B
+[ $? = 0 ] && echo [MKPART SUCCESS]
+print_dev_info $fdev
+}
+
+# 删除系统分区
+delete_one_partition() {
+delpart=$1
+if [ -n "$delpart" ]
+then
+	if [ "$delpart" = "1" ]
+	then
+		echo Do not delete the boot partition!
+	else
+		parted -s $fdev rm $delpart
+		[ $? = 0 ] && echo [DELETE SUCCESS]
+		print_dev_info $fdev
+	fi
+fi
+}
+
+# 获取ISO映像文件大小
+function get_iso_size_B() {
+read -p "Please input the ISO path: " isopath
+if [ -f "$isopath" ]
+then
+	isobytes=$(ls -l $isopath | awk '{print $5}')
+fi
+}
+
+# 显示菜单：
+# 1. 使用已有分区刷ISO
+# 2. 删除分区
+# 3. 新建分区刷ISO
+choose_dev
+if [ -b "$fdev" ]
+then
+	print_dev_info
+	get_iso_size_B
+	if [ -n "$isobytes" ]
+	then
+		create_sys_partition $isobytes
+		delete_one_partition 5
+	fi
+fi
