@@ -3,11 +3,15 @@ A tool used to create a multiple OS boot disk automaticly and parallelly, also c
 # 参数
 ## 模式
 制作模式（刷ISO）：
--m a：新创建分区刷ISO
-   r：在某已存在分区刷ISO
+
+* -m a：新创建分区刷ISO
+* -m r：在某已存在分区刷ISO
+
 维护模式（不刷ISO）：
--m d：删除某系统分区
-   i：删除所有分区，初始化U盘
+
+* -m d：删除某系统分区
+* -m i：删除所有分区，初始化U盘
+
 ## 目标磁盘设备名
 -d 设备名：如-d /dev/sdb
 ## 目标磁盘分区号
