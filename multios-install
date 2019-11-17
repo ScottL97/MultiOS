@@ -8,9 +8,30 @@ fdev= # 要制作系统安装磁盘的设备名
 tpartnums= # 要刷写ISO的分区号
 pnum= # 磁盘的分区号，用空格隔开
 isopaths= # ISO文件的路径
-arch=x86_64 # 要安装的系统架构
+tararch= # 要安装的系统架构
 climode=1 # 1表示交互模式，0表示非交互模式
 mode= # 非交互模式下的操作
+
+# 检查和安装必备软件
+check_tools() {
+sys=$(awk -F = '/^NAME/{print $2}' /etc/os-release | sed 's/"//g')
+if [ "$sys" = "CentOS Linux" ]
+then
+	rpm -qa | grep dosfstools 1>/dev/null
+	[ $? -eq 1 ] && sudo yum install -y dosfstools
+	rpm -qa | grep psmisc 1>/dev/null
+	[ $? -eq 1 ] && sudo yum install -y psmisc
+elif [ "$sys" = "Ubuntu" ] # 还未测试
+then
+	dpkg -s dosfstools 1>/dev/null
+	[ $? -eq 1 ] && sudo apt-get install -y dosfstools
+	dpkg -s psmisc 1>/dev/null
+	[ $? -eq 1 ] && sudo apt-get install -y psmisc
+else
+	echo "Unsupported sys: $sys"
+	exit 1
+fi
+}
 
 # 手动选择磁盘设备
 choose_dev() {
@@ -55,7 +76,7 @@ umount /mnt/efi 2>/dev/null
 mkdir /mnt/efi 2>/dev/null
 mount ${fdev}1 /mnt/efi/ 
 mkdir /mnt/efi/grub2
-grub2-install --efi-directory=/mnt/efi/ --boot-directory=/mnt/efi/ --directory=./${arch}-efi --removable
+grub2-install --efi-directory=/mnt/efi/ --boot-directory=/mnt/efi/ --directory=./${tararch}-efi --removable
 cp ./grub.cfg /mnt/efi/grub2
 touch /mnt/efi/os.list
 }
@@ -84,7 +105,23 @@ fi
 
 # 获取分区label，保存到boot分区的os.list文件中
 make_list() {
-echo $(blkid | sed -n '/iso9660/p' | awk -F = '{print $1 $2 $3}' | sed -e 's/: UUID/ /' -e 's/TYPE//' -e 's/LABEL//' -e 's/"//g') > /mnt/efi/os.list
+echo "# os.list" > /mnt/efi/os.list
+blkid | sed -n '/iso9660/p' | grep -v /dev/sr | awk -F = '{print $1 $2 $3}' | sed -e 's/: UUID/ /' -e 's/TYPE//' -e 's/LABEL//' -e 's/"//g' > /mnt/efi/os.list.tmp
+while read line
+do
+	part=$(echo $line | awk '{print $1}')
+	size=$(fdisk -l $part | grep Disk | awk '{print $3" "$4}' | sed 's/,//')
+	echo $line $size >> /mnt/efi/os.list
+done < /mnt/efi/os.list.tmp
+rm -rf /mnt/efi/os.list.tmp 
+}
+
+# 打印分区的系统信息
+print_os_list() {
+umount /mnt/efi 2>/dev/null
+mkdir /mnt/efi 2>/dev/null
+mount ${fdev}1 /mnt/efi
+cat /mnt/efi/os.list
 }
 
 # 在grub.cfg中增加menuentry
@@ -157,7 +194,7 @@ delete_all_partitions() {
 for num in $pnum
 do
 	umount ${fdev}${num} 2>/dev/null
-	parted -s ${fdev} rm ${num}
+	parted -s ${fdev} rm ${num} 2>/dev/null
 	[ $? -eq 1 ] && echo [DELETE SUCCESS]${fdev}${num}
 done
 }
@@ -169,6 +206,9 @@ isopath=$1
 if [ -f "$isopath" ]
 then
 	isobytes=$(ls -l $isopath | awk '{print $5}')
+else
+	echo "Wrong ISO: $isopath"
+	exit 1
 fi
 # 获取U盘新的分区的开始字节数
 # 这里是简单判断fdisk -l命令最后一行的分区号，如果之前分区号不连续，仍然会在最后的分区后面新建分区，这样会
@@ -225,9 +265,9 @@ do
 	then
 		# todo: 判断最佳bs大小，使刷写速度最快
 		bsize=1000000
-		bcount=$(expr $(ls -l ${isopaths[$i]} | awk '{print $5}') / 1000000 + 1)
+		# bcount=$(expr $(ls -l ${isopaths[$i]} | awk '{print $5}') / 1000000 + 1)
 		echo [START WRITING ISO] ${isopaths[$i]}
-		dd if=${isopaths[$i]} of=${fdev}${partnums[$i]} bs=$bsize count=$bcount &
+		dd if=${isopaths[$i]} of=${fdev}${partnums[$i]} bs=$bsize &
 	else
 		echo [DO_DD FAILED] Do not write ISO to partition 1\(EFI boot\)
 	fi
@@ -257,40 +297,52 @@ exit 1
 
 # 用户中断时终止dd命令
 trap 'INT_handler' SIGINT
-# 非交互模式，解析参数
+# 检查是否包含需要的工具，如果没有就先安装
+check_tools
+# 解析参数
 # d: target Device; s: System image path; m: Mode; p: target Partition number
-while getopts d:m:p: OPTION
+while getopts d:m:p:a: OPTION
 do
 	case $OPTION in
 	d)fdev=$OPTARG; climode=0;; # 只要含有-d参数，就认为是非交互模式
 	m)mode=$OPTARG;;
 	p)tpartnums=$OPTARG;;
+	a)tararch=$OPTARG;;
 	esac
 done
 
 # 如果没有输入-d参数，就进入交互模式
 if [ $climode -eq 1 ]
 then
-	choose_dev
-	if [ -b "$fdev" ]
-	then
-		print_dev_info
-		read -p "Please input the ISO path: " isopaths
-		if [ -n "$isopaths" ]
-		then
-			# todo：检查参数正确后显示菜单
-			create_sys_partition "$isopaths"
-			tpartnums=$?
-			do_dd "$isopaths" "$tpartnums"
-			delete_one_partition "$tpartnums"
-		fi
-	fi
+	#choose_dev
+	#if [ -b "$fdev" ]
+	#then
+	#	print_dev_info
+	#	read -p "Please input the ISO path: " isopaths
+	#	if [ -n "$isopaths" ]
+	#	then
+	#		# todo：检查参数正确后显示菜单
+	#		create_sys_partition "$isopaths"
+	#		tpartnums=$?
+	#		do_dd "$isopaths" "$tpartnums"
+	#		delete_one_partition "$tpartnums"
+	#	fi
+	#fi
+	make_list
 	exit 0
 fi
 
 # 如果输入了-d参数，则会从这里开始执行，为非交互模式
+
+# 检查必选参数是否为空
+if [ -z "$fdev" ] || [ -z "$mode" ]
+then
+	echo "Missing required parameters..."
+	exit 1
+fi
+
 # 如果是a或r模式，则需要ISO路径参数
-if [ $mode = 'a' ] || [ $mode = 'r' ]
+if [ "$mode" = "a" ] || [ "$mode" = "r" ]
 then
 	shift $((OPTIND-1))
 	if [ -z "$1" ]
@@ -308,11 +360,21 @@ then
 	fi
 fi
 
+# 如果是r或d模式，需要分区参数（-p）
+if [ "$mode" = "r" ] || [ "$mode" = "d" ]
+then
+	if [ -z "$tpartnums" ]
+	then
+		echo "Need a -p param"
+		exit 1
+	fi
+fi
 
 # 如果不是重置模式（-m i），先检查磁盘是否初始化（包含正确的boot分区）
 # 如果grub2缺少目录，重新安装grub2
 # 如果缺少正确的grub.cfg或os.list，更新这两个文件
-if [ $mode != 'i' ]
+# 如果是重置模式（-m i），检查目标系统架构是否支持
+if [ "$mode" != "i" ]
 then
 	check_if_init
 	rc=$?
@@ -324,38 +386,46 @@ then
 		make_list
 		grub2_add_menuentry	
 	fi
-fi
-if [ -n "$fdev" ] && [ -n "$mode" ]
-then
-	if [ -n "$isopaths" ]
-	then # 制作模式
-		echo $isopaths
-		case $mode in
-		# 新创建分区刷ISO
-		a)for iso in $isopaths
-		  do
-  	  		  create_sys_partition $iso
-  	  		  tpartnums="$tpartnums $?" # create_sys_partition返回新创建的分区号
-		  done
-  	  	  do_dd "$isopaths" "$tpartnums"
-	  	;;
-		# 在某已存在分区刷ISO
-		r)do_dd "$isopaths" "$tpartnums"
-	  	  ;;
-		esac
-		# 刷写结束后更新grub.cfg和os.list
-		make_list
-		grub2_add_menuentry "$tpartnums"
-	else # 维护模式
-		case $mode in
-		# 删除所有分区，初始化磁盘（创建EFI boot分区）
-		i)get_pnum
-	  	  delete_all_partitions
-	  	  init_boot_partition
-		  check_if_init
-	  	  ;;
-		# 删除某系统分区
-		d)delete_one_partition "$tpartnums";;
-		esac
+else
+	# 检查目标系统架构是否支持
+	if [ "$tararch" != "x86_64" ] && [ "$tararch" != "i386" ] && [ "$tararch" != "arm64" ]
+	then
+		echo "Wrong arch: $tararch"
+		exit 1
 	fi
+fi
+if [ -n "$isopaths" ]
+then # 制作模式
+	echo $isopaths
+	case $mode in
+	# 新创建分区刷ISO
+	a)for iso in $isopaths
+	  do
+	  	  create_sys_partition $iso
+  	  	  tpartnums="$tpartnums $?" # create_sys_partition返回新创建的分区号
+	  done
+  	  do_dd "$isopaths" "$tpartnums"
+	  ;;
+	# 在某已存在分区刷ISO
+	r)do_dd "$isopaths" "$tpartnums"
+	  ;;
+	esac
+	# 刷写结束后更新grub.cfg和os.list
+	make_list
+	grub2_add_menuentry "$tpartnums"
+else # 维护模式
+	case $mode in
+	# 删除所有分区，初始化磁盘（创建EFI boot分区）
+	i)get_pnum
+	  delete_all_partitions
+	  init_boot_partition
+	  check_if_init
+	  ;;
+	# 删除某系统分区
+	d)delete_one_partition "$tpartnums"
+	  ;;
+	# 显示所有分区的系统信息
+	p)print_os_list
+	  ;;
+	esac
 fi
